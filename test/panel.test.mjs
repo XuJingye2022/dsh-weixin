@@ -74,3 +74,41 @@ test('panel handler keeps legacy and named account operations isolated', async (
   )
   assert.deepEqual(calls, [{ account: 'family', to: 'family-user', text: 'hi' }])
 })
+
+test('login rejects a new account without a folder before requesting a QR code', async () => {
+  const prepared = []
+  const channel = {
+    accountId: 'new-account',
+    logs: [],
+    login: { poller: {} },
+    statusView: () => ({ accountId: 'new-account' }),
+    prepareLoginFolder(folder) {
+      prepared.push(folder)
+      if (!String(folder ?? '').trim()) {
+        const err = new Error('请先填写账号文件夹名')
+        err.statusCode = 400
+        throw err
+      }
+    },
+  }
+  const manager = {
+    defaultAccountId: 'new-account',
+    accountIds: () => ['new-account'],
+    account: () => channel,
+  }
+  const handler = createPanelHandler(manager)
+
+  const missing = await request(handler, 'POST', '/weixin/login', '{}')
+  assert.equal(missing.status, 400)
+  assert.match(missing.payload.error, /文件夹名/)
+
+  const accepted = await request(
+    handler,
+    'POST',
+    '/weixin/login',
+    JSON.stringify({ folder: 'alice' }),
+  )
+  assert.equal(accepted.status, 200)
+  assert.deepEqual(prepared, [undefined, 'alice'])
+  assert.match(accepted.payload.message, /已在运行/)
+})

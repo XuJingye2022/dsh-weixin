@@ -29,3 +29,20 @@ test('保存凭据以 0o600 写入且不残留临时文件（review I4/S9）', (
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('账号文件夹设置可持久化且保持 0600 权限', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-weixin-settings-'))
+  try {
+    const store = createStore(dir)
+    store.saveAccountSettings({ accountRoot: '/workspace', folder: 'alice' })
+    assert.deepEqual(store.loadAccountSettings(), { accountRoot: '/workspace', folder: 'alice' })
+    if (process.platform !== 'win32') {
+      assert.equal(
+        fs.statSync(path.join(dir, 'account-settings.json')).mode & 0o777,
+        0o600,
+      )
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -32,8 +32,8 @@ function makeStore() {
   }
 }
 
-function makeCtx() {
-  return { on: () => {}, get: () => undefined, logger: console }
+function makeCtx(services = {}) {
+  return { on: () => {}, get: (name) => services[name], logger: console }
 }
 
 function makeChannel(config = {}) {
@@ -480,6 +480,132 @@ test('push 主动推送：单用户与 all 广播', async () => {
 test('resolveWorkspaceDir：空值回落到 stateDir/workspace，显式值用显式', () => {
   assert.equal(resolveWorkspaceDir('', '/tmp/state'), path.resolve('/tmp/state/workspace'))
   assert.equal(resolveWorkspaceDir('/custom/ws', '/tmp/state'), path.resolve('/custom/ws'))
+})
+
+test('new WeChat agents use the account folder without creating a DSH workspace', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-weixin-agent-folder-'))
+  let createdMeta
+  const agents = {
+    get: () => undefined,
+    create: async ({ sessionId, meta }) => {
+      createdMeta = meta
+      return { agent: { id: sessionId } }
+    },
+  }
+  const ctx = makeCtx({
+    workspaceRegistry: { create: async () => assert.fail('must not create a DSH workspace') },
+    agents,
+  })
+  ctx.agents = agents
+  const store = makeStore()
+  let saved
+  store.saveSessionMap = (map) => { saved = map }
+  const ch = new WeixinChannel(ctx, {
+    accountId: 'primary',
+    accountRoot: root,
+    folder: 'alice',
+    cwd: path.join(root, 'alice'),
+    stateDir: '',
+    replyMode: 'full',
+    replyTimeoutMs: 60_000,
+    maxChunk: 1500,
+    sendIntervalMs: 0,
+  }, store, { autoStart: false })
+
+  try {
+    const agent = await ch.ensureAgentFor(FROM)
+    assert.deepEqual(createdMeta, { cwd: path.join(root, 'alice') })
+    assert.equal(saved[FROM], agent.id)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('login folder is mandatory and is persisted under accountRoot', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-weixin-login-folder-'))
+  const store = makeStore()
+  let savedSettings
+  store.loadAccountSettings = () => ({})
+  store.saveAccountSettings = (settings) => { savedSettings = settings }
+  const ch = new WeixinChannel(makeCtx(), {
+    accountId: 'new-account',
+    accountRoot: root,
+    folder: '',
+    cwd: '',
+    stateDir: '',
+    replyMode: 'full',
+    replyTimeoutMs: 60_000,
+    maxChunk: 1500,
+    sendIntervalMs: 0,
+  }, store, { autoStart: false })
+
+  try {
+    assert.throws(() => ch.prepareLoginFolder(''), (err) => err.statusCode === 400)
+    assert.equal(fs.existsSync(path.join(root, 'alice')), false)
+
+    ch.prepareLoginFolder('alice')
+    assert.equal(ch.folder, 'alice')
+    assert.equal(ch.cfg.cwd, path.join(root, 'alice'))
+    assert.equal(fs.statSync(path.join(root, 'alice')).isDirectory(), true)
+    assert.equal(savedSettings.folder, 'alice')
+    assert.equal(savedSettings.accountRoot, root)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('persisted account folder is restored on restart', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-weixin-folder-restart-'))
+  const stateDir = path.join(root, 'state')
+  try {
+    const store = createStore(stateDir)
+    store.saveAccountSettings({ accountRoot: root, folder: 'persisted' })
+    const ch = new WeixinChannel(makeCtx(), {
+      accountId: 'primary',
+      accountRoot: root,
+      folder: 'configured',
+      cwd: path.join(root, 'configured'),
+      stateDir,
+      replyMode: 'full',
+      replyTimeoutMs: 60_000,
+      maxChunk: 1500,
+      sendIntervalMs: 0,
+    }, store, { autoStart: false })
+
+    assert.equal(ch.folder, 'persisted')
+    assert.equal(ch.cfg.cwd, path.join(root, 'persisted'))
+    assert.equal(fs.statSync(path.join(root, 'persisted')).isDirectory(), true)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('changing folder after logout clears stale session mappings', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-weixin-folder-change-'))
+  const store = makeStore()
+  let savedMap
+  store.saveSessionMap = (map) => { savedMap = map }
+  const ch = new WeixinChannel(makeCtx(), {
+    accountId: 'primary',
+    accountRoot: root,
+    folder: 'old-folder',
+    cwd: path.join(root, 'old-folder'),
+    stateDir: '',
+    replyMode: 'full',
+    replyTimeoutMs: 60_000,
+    maxChunk: 1500,
+    sendIntervalMs: 0,
+  }, store, { autoStart: false })
+  ch.sessionMap = { [FROM]: 'session-old-folder' }
+
+  try {
+    ch.setAccountFolder('new-folder')
+    assert.deepEqual(ch.sessionMap, {})
+    assert.deepEqual(savedMap, {})
+    assert.equal(ch.cfg.cwd, path.join(root, 'new-folder'))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('超时后 turn/end 不重复发送（review I1）', async () => {

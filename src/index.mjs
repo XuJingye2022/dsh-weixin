@@ -9,12 +9,16 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 import * as ilink from './ilink.mjs'
 import {
   DEFAULT_ACCOUNT_ID,
   assertAccountId,
+  assertFolderName,
   createAccountStore,
+  ensureAccountWorkspace,
   normalizeAccounts,
 } from './accounts.mjs'
 import { registerPanel } from './panel.mjs'
@@ -25,9 +29,12 @@ export const inject = ['webServer', 'agents', 'tools', 'attachments']
 
 /** 可配置参数（默认值即 schema 默认，可在 cordis.yml 覆盖）。 */
 export const Config = Schema.object({
+  // 多账号目录根；每个账号使用其直接子目录，不会自动注册成 DSH Workspace。
+  accountRoot: Schema.string().default(''),
   // 可选的多账号配置；留空时自动创建向后兼容的 default 账号。
   accounts: Schema.array(Schema.object({
     id: Schema.string().required(),
+    folder: Schema.string().default(''),
     cwd: Schema.string().default(''),
   })).default([]),
   // /weixin 与 ctx.weixin 的默认账号；留空取 accounts 第一项。
@@ -91,6 +98,9 @@ export class WeixinChannel {
     this.cfg = config
     this.store = store
     this.accountId = config.accountId
+    this.accountRoot = config.accountRoot ?? ''
+    const configuredFolder = config.folder || (config.cwd ? path.basename(config.cwd) : '')
+    this.folder = configuredFolder
     this.ilink = ilinkApi
     this.log = ctx.logger ?? console
     this.creds = store.loadCredentials()
@@ -127,6 +137,23 @@ export class WeixinChannel {
     this.downloadImageBytes = this.ilink.downloadImageBytes // 测试注入点（默认走 CDN 下载解密）
     this.visionCache = new Map() // `provider:model` -> boolean（模型是否支持图片输入）
 
+    const savedSettings = this.store.loadAccountSettings?.() ?? {}
+    if (
+      savedSettings.folder
+      && savedSettings.accountRoot
+      && this.accountRoot
+      && path.resolve(savedSettings.accountRoot) === path.resolve(this.accountRoot)
+    ) {
+      try {
+        this.folder = assertFolderName(savedSettings.folder)
+        this.cfg.folder = this.folder
+        this.cfg.cwd = ensureAccountWorkspace(this.accountRoot, this.folder)
+      } catch (err) {
+        this.folder = configuredFolder
+        this.pushLog(`读取账号文件夹设置失败，沿用配置：${err?.message ?? err}`)
+      }
+    }
+
     this.ctx.on('session/event', (session, event) => this.handleSessionEvent(session, event))
     this.ctx.on('dispose', () => this.stop())
 
@@ -146,6 +173,12 @@ export class WeixinChannel {
   /* ------------------------------ 生命周期 ------------------------------ */
 
   async startMonitor() {
+    if (!this.cfg.cwd || !this.folder) {
+      this.monitorRunning = false
+      this.status.lastError = '账号未配置文件夹，暂不启动消息轮询'
+      this.pushLog(this.status.lastError)
+      return
+    }
     const cred = this.creds
     cred.baseurl = cred.baseurl || this.ilink.DEFAULT_BASE_URL
     this.status.baseUrl = cred.baseurl
@@ -239,6 +272,9 @@ export class WeixinChannel {
 
   /** 登录成功后应用新凭证并重启监视循环。 */
   applyCredentials(cred) {
+    if (!this.cfg.cwd || !this.folder) {
+      throw new Error('请先填写账号文件夹名')
+    }
     this.cancelPending()
     this.typingTickets.clear()
     this.inbox.length = 0
@@ -377,8 +413,47 @@ export class WeixinChannel {
     return {}
   }
 
+  /**
+   * 在管理页绑定前设置账号文件夹。已登录账号不允许直接改目录，避免旧会话跨目录续用。
+   * 登出后改目录会清空该账号的会话映射，但保留消息去重等账号状态。
+   */
+  setAccountFolder(value) {
+    const folder = assertFolderName(value)
+    if (!this.accountRoot) throw new Error('未配置 accountRoot，无法设置账号文件夹')
+    if (folder === this.folder && this.cfg.cwd) return this.cfg.cwd
+    if (this.creds?.bot_token) {
+      throw new Error('已绑定账号不能直接更换文件夹，请先登出')
+    }
+    const cwd = ensureAccountWorkspace(this.accountRoot, folder)
+    if (this.folder && folder !== this.folder) {
+      this.sessionMap = {}
+      this.store.saveSessionMap(this.sessionMap)
+    }
+    this.folder = folder
+    this.cfg.folder = folder
+    this.cfg.cwd = cwd
+    this.store.saveAccountSettings?.({
+      accountRoot: this.accountRoot,
+      folder,
+      updatedAt: Date.now(),
+    })
+    this.pushLog(`账号文件夹已设为 ${folder}`)
+    return cwd
+  }
+
+  prepareLoginFolder(value) {
+    const folder = String(value ?? '').trim()
+    if (folder) this.setAccountFolder(folder)
+    if (!this.folder || !this.cfg.cwd) {
+      const err = new Error('请先填写账号文件夹名')
+      err.statusCode = 400
+      throw err
+    }
+  }
+
   /** 微信用户 → 会话/代理。已有则复用；持久化会话则恢复；否则新建。 */
   async ensureAgentFor(userId) {
+    if (!this.cfg.cwd || !this.folder) throw new Error('账号未配置文件夹')
     const sessionId = this.sessionMap[userId]
     if (sessionId) {
       const live = this.ctx.agents.get(sessionId)
@@ -715,6 +790,8 @@ export class WeixinChannel {
     const paused = this.status.pausedUntil != null && this.status.pausedUntil > now
     return {
       accountId: this.accountId,
+      folder: this.folder,
+      accountRoot: this.accountRoot,
       cwd: this.cfg.cwd,
       connected: this.monitorRunning && !!this.creds?.bot_token && polling && !paused,
       loggedInAt: this.creds?.loggedInAt ?? null,
@@ -768,17 +845,24 @@ export class WeixinManager {
     this.log = ctx.logger ?? console
     const normalized = normalizeAccounts(config)
     this.stateDir = normalized.stateDir
+    this.accountRoot = normalized.accountRoot
     this.defaultAccountId = normalized.defaultAccountId
     this.channels = new Map()
 
     for (const account of normalized.accounts) {
+      if (account.cwd) {
+        if (this.accountRoot) ensureAccountWorkspace(this.accountRoot, account.folder)
+        else fs.mkdirSync(account.cwd, { recursive: true })
+      }
       const store = createAccountStore(this.stateDir, account.id, {
         migrateLegacy: account.id === this.defaultAccountId,
       })
       const channelConfig = {
         ...config,
         accountId: account.id,
+        accountRoot: this.accountRoot,
         stateDir: account.stateDir,
+        folder: account.folder,
         cwd: account.cwd,
       }
       this.channels.set(account.id, channelFactory(ctx, channelConfig, store))

@@ -45,13 +45,14 @@ test('manager isolates credentials, sessions, cursors, and cwd per account', () 
       makeCtx(),
       {
         stateDir: root,
+        accountRoot: root,
         replyMode: 'full',
         replyTimeoutMs: 60_000,
         maxChunk: 1500,
         sendIntervalMs: 0,
         accounts: [
-          { id: 'primary', cwd: path.join(root, 'work-primary') },
-          { id: 'family', cwd: path.join(root, 'work-family') },
+          { id: 'primary', folder: 'alice' },
+          { id: 'family', folder: 'bob' },
         ],
       },
       { autoStart: false },
@@ -62,8 +63,12 @@ test('manager isolates credentials, sessions, cursors, and cwd per account', () 
     assert.notEqual(primary, family)
     assert.equal(manager.account(), primary)
     assert.equal(primary.accountId, 'primary')
-    assert.equal(primary.cfg.cwd, path.join(root, 'work-primary'))
-    assert.equal(family.cfg.cwd, path.join(root, 'work-family'))
+    assert.equal(primary.folder, 'alice')
+    assert.equal(family.folder, 'bob')
+    assert.equal(primary.cfg.cwd, path.join(root, 'alice'))
+    assert.equal(family.cfg.cwd, path.join(root, 'bob'))
+    assert.equal(fs.statSync(primary.cfg.cwd).isDirectory(), true)
+    assert.equal(fs.statSync(family.cfg.cwd).isDirectory(), true)
     assert.deepEqual(primary.sessionMap, { 'primary@im.wechat': 'session-primary' })
     assert.deepEqual(family.sessionMap, { 'family@im.wechat': 'session-family' })
     assert.equal(primary.buf, 'cursor-primary')

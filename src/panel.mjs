@@ -74,7 +74,8 @@ function qrSvg(text, size = 320) {
 
 /* ------------------------------ 登录流程 ------------------------------ */
 
-async function startLogin(channel) {
+async function startLogin(channel, folder) {
+  channel.prepareLoginFolder?.(folder)
   if (channel.login?.poller) {
     return { started: true, message: '登录流程已在运行' }
   }
@@ -276,7 +277,8 @@ export function createPanelHandler(manager) {
         if (!l?.qrUrl) return sendText(res, 'no qr', 'text/plain', 404)
         sendText(res, qrSvg(l.qrUrl), 'image/svg+xml')
       } else if (route.action === 'login' && req.method === 'POST') {
-        sendJson(res, await startLogin(channel))
+        const body = JSON.parse((await readBody(req)) || '{}')
+        sendJson(res, await startLogin(channel, body?.folder))
       } else if (route.action === 'verifycode' && req.method === 'POST') {
         const body = JSON.parse((await readBody(req)) || '{}')
         sendJson(res, submitVerifyCode(channel, body?.code ?? ''))
@@ -349,6 +351,13 @@ function sendHtml(res, manager, activeAccountId) {
   <nav>${accountLinks}</nav>
 </div>
 <div class="card">
+  <div class="row"><b>账号文件夹</b></div>
+  <div class="row">
+    <input id="folder" placeholder="填写单段文件夹名" autocomplete="off" style="padding:6px 8px;font-size:14px;min-width:260px">
+  </div>
+  <div class="row muted">绑定账号前必须填写；插件会在 accountRoot 下自动创建，不会自动生成 DSH 侧边栏工作区。</div>
+</div>
+<div class="card">
   <div class="row">状态：<b id="conn" class="bad">未知</b></div>
   <div class="row muted" id="meta"></div>
   <div class="row">
@@ -375,6 +384,8 @@ function sendHtml(res, manager, activeAccountId) {
 <script>
 const BASE = ${JSON.stringify(basePath)};
 const $ = (id) => document.getElementById(id);
+let folderDirty = false;
+$('folder').addEventListener('input', () => { folderDirty = true; });
 async function j(url, opts) { const r = await fetch(url, opts); return r.json(); }
 function render(s) {
   const on = s.connected;
@@ -383,6 +394,8 @@ function render(s) {
     : (s.pausedUntil ? '已暂停' : '未连接');
   $('conn').className = on ? 'ok' : 'bad';
   const meta = [];
+  if (s.folder) meta.push('文件夹：' + s.folder);
+  if (s.cwd) meta.push('目录：' + s.cwd);
   if (s.loggedInAt) meta.push('登录时间：' + new Date(s.loggedInAt).toLocaleString());
   if (s.lastPollAt) meta.push('最近轮询：' + new Date(s.lastPollAt).toLocaleString());
   if (s.lastInboundAt) meta.push('最近来消息：' + new Date(s.lastInboundAt).toLocaleString());
@@ -391,6 +404,7 @@ function render(s) {
   if (s.lastError && !s.pauseReason) meta.push('最近错误：' + s.lastError);
   if (!s.loggedInAt && !s.lastError) meta.push('未登录');
   $('meta').textContent = meta.join(' · ');
+  if (!folderDirty) $('folder').value = s.folder || '';
   const rows = Object.entries(s.sessionMap || {});
   const tbl = $('sessions');
   tbl.replaceChildren();
@@ -423,7 +437,17 @@ function render(s) {
   if (on) setTimeout(tick, 2000); else setTimeout(tick, 5000);
 }
 async function tick() { try { render(await j(BASE + '/status')); } catch { /* 重试 */ } }
-async function login() { const r = await j(BASE + '/login', { method: 'POST' }); if (r.error) alert(r.error); tick(); }
+async function login() {
+  const folder = $('folder').value.trim();
+  if (!folder) { alert('请先填写账号文件夹名'); return; }
+  const r = await j(BASE + '/login', {
+    method: 'POST',
+    headers: {'content-type':'application/json'},
+    body: JSON.stringify({ folder }),
+  });
+  if (r.error) alert(r.error); else folderDirty = false;
+  tick();
+}
 async function logout() { if (!confirm('确定登出该微信账号？')) return; await j(BASE + '/logout', { method: 'POST' }); tick(); }
 async function submitCode() { const r = await j(BASE + '/verifycode', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ code: $('code').value }) }); if (!r.ok) alert(r.message || r.error); tick(); }
 async function logs() { try { const r = await j(BASE + '/logs'); $('logs').textContent = r.logs.join('\\n'); } catch {} }

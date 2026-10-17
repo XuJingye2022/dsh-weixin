@@ -5,6 +5,7 @@ import { createStore, resolveStateDir, resolveWorkspaceDir } from './creds.mjs'
 export const DEFAULT_ACCOUNT_ID = 'default'
 
 const ACCOUNT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+const MAX_FOLDER_NAME_LENGTH = 128
 const RESERVED_ACCOUNT_IDS = new Set([
   'status', 'logs', 'qr.svg', 'login', 'verifycode', 'logout', 'send',
 ])
@@ -37,14 +38,75 @@ export function accountStateDir(stateDir, accountId) {
   return dir
 }
 
+/** 账号文件夹必须是账号根目录下的单段目录名。 */
+export function assertFolderName(value) {
+  const folder = String(value ?? '').trim()
+  const deviceBase = folder.split('.')[0].toUpperCase()
+  if (
+    !folder
+    || folder.length > MAX_FOLDER_NAME_LENGTH
+    || folder === '.'
+    || folder === '..'
+    || folder.includes('/')
+    || folder.includes('\\')
+    || folder.includes(':')
+    || /[\u0000-\u001f\u007f]/.test(folder)
+    || WINDOWS_DEVICE_NAMES.has(deviceBase)
+    || folder.endsWith('.')
+    || folder.endsWith(' ')
+  ) {
+    throw new Error('文件夹名只能是单段目录名，且不能包含路径分隔符')
+  }
+  return folder
+}
+
+export function resolveAccountWorkspace(accountRoot, folder) {
+  const root = String(accountRoot ?? '').trim()
+  if (!root) throw new Error('未配置账号目录根 accountRoot')
+  const resolvedRoot = path.resolve(root)
+  const resolved = path.resolve(resolvedRoot, assertFolderName(folder))
+  if (path.dirname(resolved) !== resolvedRoot) {
+    throw new Error('账号文件夹不能跳出 accountRoot')
+  }
+  return resolved
+}
+
+/** 创建账号目录，并拒绝通过符号链接跳出 accountRoot。 */
+export function ensureAccountWorkspace(accountRoot, folder) {
+  const dir = resolveAccountWorkspace(accountRoot, folder)
+  const root = path.dirname(dir)
+  fs.mkdirSync(root, { recursive: true })
+  fs.mkdirSync(dir, { recursive: true })
+  if (fs.lstatSync(dir).isSymbolicLink()) {
+    throw new Error('账号文件夹不能是符号链接')
+  }
+  const realRoot = fs.realpathSync(root)
+  const realDir = fs.realpathSync(dir)
+  if (path.dirname(realDir) !== realRoot) {
+    throw new Error('账号文件夹解析后必须仍位于 accountRoot 内')
+  }
+  return dir
+}
+
 export function normalizeAccounts(config = {}) {
   const stateDir = resolveStateDir(config.stateDir)
   const configured = Array.isArray(config.accounts) ? config.accounts : []
   const entries = configured.length
     ? configured
     : [{ id: DEFAULT_ACCOUNT_ID, cwd: config.cwd }]
+  const configuredRoot = String(config.accountRoot ?? '').trim()
+
+  const explicitCwds = entries
+    .map((entry) => String(entry?.cwd ?? '').trim())
+    .filter(Boolean)
+  const parents = explicitCwds.map((cwd) => path.dirname(path.resolve(cwd)))
+  const inferredRoot = parents.length > 0 && parents.every(
+    (parent) => parent.toLowerCase() === parents[0].toLowerCase(),
+  ) ? parents[0] : ''
+  const accountRoot = configuredRoot ? path.resolve(configuredRoot) : inferredRoot
 
   const seen = new Set()
+  const seenWorkspaces = new Map()
   const accounts = entries.map((entry, index) => {
     const id = assertAccountId(entry?.id)
     const key = id.toLowerCase()
@@ -53,10 +115,44 @@ export function normalizeAccounts(config = {}) {
 
     const state = accountStateDir(stateDir, id)
     const fallbackCwd = !configured.length && index === 0 ? config.cwd : ''
+    const configuredCwd = String(entry?.cwd || fallbackCwd || '').trim()
+    let folder = String(entry?.folder ?? '').trim()
+    let cwd = ''
+
+    if (folder) {
+      folder = assertFolderName(folder)
+      cwd = resolveAccountWorkspace(accountRoot, folder)
+      if (configuredCwd && path.resolve(configuredCwd) !== cwd) {
+        throw new Error(`账号 ${id} 的 folder 与 cwd 指向不同目录`)
+      }
+    } else if (configuredCwd) {
+      cwd = path.resolve(configuredCwd)
+      if (accountRoot) {
+        if (path.dirname(cwd) !== accountRoot) {
+          throw new Error(`账号 ${id} 的工作目录必须直接位于 accountRoot 下`)
+        }
+        folder = path.basename(cwd)
+      } else {
+        folder = path.basename(cwd)
+      }
+    } else if (!configured.length) {
+      // 单账号旧配置没有 cwd/folder 时维持原有 stateDir/workspace 行为。
+      cwd = resolveWorkspaceDir('', state)
+      folder = path.basename(cwd)
+    }
+
+    if (cwd) {
+      const workspaceKey = cwd.toLowerCase()
+      const owner = seenWorkspaces.get(workspaceKey)
+      if (owner) throw new Error(`账号 ${id} 与 ${owner} 使用了同一个工作目录`)
+      seenWorkspaces.set(workspaceKey, id)
+    }
+
     return {
       id,
       stateDir: state,
-      cwd: resolveWorkspaceDir(entry?.cwd || fallbackCwd, state),
+      folder,
+      cwd,
     }
   })
 
@@ -70,7 +166,7 @@ export function normalizeAccounts(config = {}) {
     throw new Error(`默认账号不存在：${requestedDefault}`)
   }
 
-  return { stateDir, defaultAccountId: defaultAccount.id, accounts }
+  return { stateDir, accountRoot, defaultAccountId: defaultAccount.id, accounts }
 }
 
 const LEGACY_FILES = ['credentials.json', 'session-map.json', 'updates-buf.json']

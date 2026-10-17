@@ -45,6 +45,7 @@ export function createStore(stateDir) {
   const sessionMapFile = path.join(dir, 'session-map.json')
   const bufFile = path.join(dir, 'updates-buf.json')
   const seenMessagesFile = path.join(dir, 'seen-messages.json')
+  const accountSettingsFile = path.join(dir, 'account-settings.json')
 
   return {
     dir,
@@ -64,5 +65,7 @@ export function createStore(stateDir) {
         : []
     },
     saveSeenMessages: (values) => saveJson(seenMessagesFile, values.slice(-1000)),
+    loadAccountSettings: () => loadJson(accountSettingsFile, {}),
+    saveAccountSettings: (settings) => saveJson(accountSettingsFile, settings),
   }
 }
