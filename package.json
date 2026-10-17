@@ -1,6 +1,6 @@
 {
   "name": "dsh-weixin",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "微信 ClawBot (iLink) 多账号通道插件：把多个微信机器人接入 DeepSeek Harness，按账号和用户隔离会话、工作目录与消息回发。",
   "type": "module",
   "main": "index.mjs",

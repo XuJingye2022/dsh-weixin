@@ -8,10 +8,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createCipheriv } from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { WeixinChannel, chunkText, registerPushTool } from '../src/index.mjs'
-import { resolveWorkspaceDir } from '../src/creds.mjs'
-import { normalizeInboundMessages, sniffImageMime, parseAesKey, downloadImageBytes } from '../src/ilink.mjs'
+import { createStore, resolveWorkspaceDir } from '../src/creds.mjs'
+import {
+  ILinkError,
+  normalizeInboundMessages,
+  sniffImageMime,
+  parseAesKey,
+  downloadImageBytes,
+} from '../src/ilink.mjs'
 
 function makeStore() {
   return {
@@ -48,6 +56,20 @@ function makeChannel(config = {}) {
 const FROM = 'wechat-user-1@im.wechat'
 const SESSION = 'session-test-1'
 const tick = () => new Promise((r) => setTimeout(r, 0))
+function waitFor(predicate, timeoutMs = 1000) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
+    const timer = setInterval(() => {
+      if (predicate()) {
+        clearInterval(timer)
+        resolve()
+      } else if (Date.now() - startedAt >= timeoutMs) {
+        clearInterval(timer)
+        reject(new Error(`等待条件超时（${timeoutMs}ms）`))
+      }
+    }, 10)
+  })
+}
 
 test('整轮助手文本合并回复，并正确关联用户', async () => {
   const ch = makeChannel()
@@ -65,7 +87,230 @@ test('整轮助手文本合并回复，并正确关联用户', async () => {
   assert.equal(ch.sent[0].to, FROM)
   assert.equal(ch.sent[0].text, '我先查一下…\n最终回复内容')
   assert.equal(ch.pending.has(msgId), false)
-  assert.equal(ch.collector, null)
+  assert.equal(ch.collectors.size, 0)
+})
+
+test('long-running message processing does not stop getupdates polling', async () => {
+  let pollCalls = 0
+  let releaseTask
+  let processingStarted
+  const processing = new Promise((resolve) => { processingStarted = resolve })
+  const api = {
+    normalizeInboundMessages,
+    DEFAULT_BASE_URL: 'https://example.invalid',
+    async notifyStart() {},
+    async notifyStop() {},
+    getUpdates({ signal }) {
+      pollCalls += 1
+      if (pollCalls === 1) {
+        return Promise.resolve({
+          ret: 0,
+          msgs: [{
+            message_id: 'message-long-task',
+            from_user_id: FROM,
+            to_user_id: 'bot@im.bot',
+            context_token: 'tok',
+            item_list: [{ type: 1, text_item: { text: 'long task' } }],
+          }],
+        })
+      }
+      return new Promise((resolve) => {
+        signal.addEventListener('abort', () => resolve({ ret: 0, msgs: [] }), { once: true })
+      })
+    },
+  }
+  const ch = new WeixinChannel(makeCtx(), {
+    cwd: '/tmp',
+    stateDir: '',
+    replyMode: 'full',
+    replyTimeoutMs: 60_000,
+    maxChunk: 1500,
+    sendIntervalMs: 0,
+  }, makeStore(), { ilinkApi: api, autoStart: false })
+  ch.creds = { bot_token: 'tok', baseurl: 'https://example.invalid' }
+  ch.handleInbound = async () => {
+    processingStarted()
+    await new Promise((resolve) => { releaseTask = resolve })
+  }
+  ch.startMonitor()
+  await processing
+  await waitFor(() => pollCalls >= 2, 300)
+  const status = ch.statusView()
+  assert.equal(status.connected, true)
+  assert.equal(status.processing, true)
+  releaseTask()
+  await ch.stop()
+})
+
+test('a repeated iLink message_id is processed only once', async () => {
+  let pollCalls = 0
+  const handled = []
+  const message = {
+    message_id: 'message-duplicate',
+    from_user_id: FROM,
+    to_user_id: 'bot@im.bot',
+    context_token: 'tok',
+    item_list: [{ type: 1, text_item: { text: 'duplicate delivery' } }],
+  }
+  const api = {
+    normalizeInboundMessages,
+    DEFAULT_BASE_URL: 'https://example.invalid',
+    async notifyStart() {},
+    async notifyStop() {},
+    getUpdates({ signal }) {
+      pollCalls += 1
+      if (pollCalls <= 2) return Promise.resolve({ ret: 0, msgs: [message] })
+      return new Promise((resolve) => {
+        signal.addEventListener('abort', () => resolve({ ret: 0, msgs: [] }), { once: true })
+      })
+    },
+  }
+  const ch = new WeixinChannel(makeCtx(), {
+    cwd: '/tmp',
+    stateDir: '',
+    replyMode: 'full',
+    replyTimeoutMs: 60_000,
+    maxChunk: 1500,
+    sendIntervalMs: 0,
+  }, makeStore(), { ilinkApi: api, autoStart: false })
+  ch.creds = { bot_token: 'tok', baseurl: 'https://example.invalid' }
+  ch.handleInbound = async (msg) => { handled.push(msg) }
+
+  ch.startMonitor()
+  await waitFor(() => pollCalls >= 3, 300)
+  await tick()
+  assert.equal(handled.length, 1)
+  await ch.stop()
+})
+
+test('processed message_id stays deduplicated after restart', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-weixin-dedupe-'))
+  const message = {
+    message_id: 'message-persistent',
+    from_user_id: FROM,
+    to_user_id: 'bot@im.bot',
+    context_token: 'tok',
+    item_list: [{ type: 1, text_item: { text: 'persist dedupe' } }],
+  }
+  const makeApi = () => {
+    let calls = 0
+    return {
+      normalizeInboundMessages,
+      DEFAULT_BASE_URL: 'https://example.invalid',
+      async notifyStart() {},
+      async notifyStop() {},
+      getUpdates({ signal }) {
+        calls += 1
+        if (calls === 1) return Promise.resolve({ ret: 0, msgs: [message] })
+        return new Promise((resolve) => {
+          signal.addEventListener('abort', () => resolve({ ret: 0, msgs: [] }), { once: true })
+        })
+      },
+      callCount: () => calls,
+    }
+  }
+  const config = {
+    cwd: '/tmp',
+    stateDir: root,
+    replyMode: 'full',
+    replyTimeoutMs: 60_000,
+    maxChunk: 1500,
+    sendIntervalMs: 0,
+  }
+  const handled = []
+  try {
+    const store = createStore(root)
+    store.saveCredentials({ bot_token: 'tok', baseurl: 'https://example.invalid' })
+    const firstApi = makeApi()
+    const first = new WeixinChannel(makeCtx(), config, store, { ilinkApi: firstApi, autoStart: false })
+    first.creds = store.loadCredentials()
+    first.handleInbound = async () => { handled.push('first') }
+    first.startMonitor()
+    await waitFor(() => handled.length === 1, 300)
+    await first.stop()
+
+    const restartedApi = makeApi()
+    const restarted = new WeixinChannel(
+      makeCtx(),
+      config,
+      createStore(root),
+      { ilinkApi: restartedApi, autoStart: false },
+    )
+    restarted.creds = restarted.store.loadCredentials()
+    restarted.handleInbound = async () => { handled.push('restarted') }
+    restarted.startMonitor()
+    await waitFor(() => restartedApi.callCount() >= 2, 300)
+    await tick()
+    assert.deepEqual(handled, ['first'])
+    await restarted.stop()
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('status reports disconnected when the polling heartbeat is stale', async () => {
+  const api = {
+    normalizeInboundMessages,
+    DEFAULT_BASE_URL: 'https://example.invalid',
+    async notifyStart() {},
+    async notifyStop() {},
+    getUpdates({ signal }) {
+      return new Promise((resolve) => {
+        signal.addEventListener('abort', () => resolve({ ret: 0, msgs: [] }), { once: true })
+      })
+    },
+  }
+  const ch = new WeixinChannel(makeCtx(), {
+    cwd: '/tmp',
+    stateDir: '',
+    replyMode: 'full',
+    replyTimeoutMs: 60_000,
+    maxChunk: 1500,
+    sendIntervalMs: 0,
+    pollStaleMs: 20,
+  }, makeStore(), { ilinkApi: api, autoStart: false })
+  ch.creds = { bot_token: 'tok', baseurl: 'https://example.invalid' }
+
+  ch.startMonitor()
+  await waitFor(() => ch.statusView().connected === false, 300)
+  const status = ch.statusView()
+  assert.equal(typeof status.lastPollAt, 'number')
+  assert.equal(status.processing, false)
+  assert.equal(status.queued, 0)
+  await ch.stop()
+})
+
+test('ret=-14 pauses the account and reports why it is disconnected', async () => {
+  let calls = 0
+  const api = {
+    normalizeInboundMessages,
+    DEFAULT_BASE_URL: 'https://example.invalid',
+    async notifyStart() {},
+    async notifyStop() {},
+    async getUpdates() {
+      calls += 1
+      throw new ILinkError('getupdates ret=-14 errcode=0 errmsg=session expired', { ret: -14 })
+    },
+  }
+  const ch = new WeixinChannel(makeCtx(), {
+    cwd: '/tmp',
+    stateDir: '',
+    replyMode: 'full',
+    replyTimeoutMs: 60_000,
+    maxChunk: 1500,
+    sendIntervalMs: 0,
+    pollStaleMs: 60_000,
+  }, makeStore(), { ilinkApi: api, autoStart: false })
+  ch.creds = { bot_token: 'tok', baseurl: 'https://example.invalid' }
+
+  ch.startMonitor()
+  await waitFor(() => typeof ch.statusView().pausedUntil === 'number', 300)
+  const status = ch.statusView()
+  assert.equal(status.connected, false)
+  assert.match(status.pauseReason, /ret=-14/)
+  assert.ok(status.pausedUntil > Date.now() + 59 * 60_000)
+  assert.equal(calls, 1)
+  await ch.stop()
 })
 
 test('错误会话的事件不触发回复，也不清理 pending', async () => {
@@ -97,6 +342,87 @@ test('replyMode=last 只回最后一条助手文本', async () => {
 
   assert.equal(ch.sent.length, 1)
   assert.equal(ch.sent[0].text, '结论')
+})
+
+test('interleaved queued turns keep their own collectors and replies', async () => {
+  const ch = makeChannel()
+  const pendingA = {
+    from: 'user-a@im.wechat',
+    contextToken: 'ctx-a',
+    sessionId: 'session-a',
+    resolve: () => {},
+    timer: null,
+  }
+  const pendingB = {
+    from: 'user-b@im.wechat',
+    contextToken: 'ctx-b',
+    sessionId: 'session-b',
+    resolve: () => {},
+    timer: null,
+  }
+  ch.pending.set('message-a', pendingA)
+  ch.pending.set('message-b', pendingB)
+
+  ch.handleSessionEvent({ id: 'session-a' }, { type: 'turn/start', data: { turn: 1 } })
+  ch.handleSessionEvent({ id: 'session-a' }, { type: 'user/message', data: { id: 'message-a' } })
+  ch.handleSessionEvent({ id: 'session-b' }, { type: 'turn/start', data: { turn: 2 } })
+  ch.handleSessionEvent({ id: 'session-b' }, { type: 'user/message', data: { id: 'message-b' } })
+  ch.handleSessionEvent({ id: 'session-a' }, {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: [{ type: 'text', text: 'reply-a' }] } },
+  })
+  ch.handleSessionEvent({ id: 'session-b' }, {
+    type: 'assistant/message',
+    data: { turn: 2, message: { content: [{ type: 'text', text: 'reply-b' }] } },
+  })
+  ch.handleSessionEvent({ id: 'session-a' }, {
+    type: 'turn/end',
+    data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  ch.handleSessionEvent({ id: 'session-b' }, {
+    type: 'turn/end',
+    data: { turn: 2, reason: { kind: 'completed' } },
+  })
+  await tick()
+
+  assert.deepEqual(
+    ch.sent.map(({ to, text }) => ({ to, text })).sort((a, b) => a.to.localeCompare(b.to)),
+    [
+      { to: 'user-a@im.wechat', text: 'reply-a' },
+      { to: 'user-b@im.wechat', text: 'reply-b' },
+    ],
+  )
+})
+
+test('same-account messages run serially in arrival order', async () => {
+  const ch = makeChannel()
+  const handled = []
+  let active = 0
+  let maxActive = 0
+  let releaseFirst
+  let firstStarted
+  const firstProcessing = new Promise((resolve) => { firstStarted = resolve })
+  ch.handleInbound = async (msg) => {
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    handled.push(msg.text)
+    if (msg.text === 'first') {
+      firstStarted()
+      await new Promise((resolve) => { releaseFirst = resolve })
+    }
+    active -= 1
+  }
+
+  ch.enqueueInbound({ text: 'first' })
+  ch.enqueueInbound({ text: 'second' })
+  await firstProcessing
+  await tick()
+  assert.deepEqual(handled, ['first'])
+
+  releaseFirst()
+  await waitFor(() => handled.length === 2, 300)
+  assert.deepEqual(handled, ['first', 'second'])
+  assert.equal(maxActive, 1)
 })
 
 test('长文本按 maxChunk 切分', () => {
@@ -160,19 +486,20 @@ test('超时后 turn/end 不重复发送（review I1）', async () => {
   const ch = makeChannel()
   let resolved = false
   // 模拟超时已发生：pending 已从 map 移除，collector 仍残留旧引用
-  ch.collector = {
+  const staleCollector = {
     sessionId: SESSION,
     turn: 9,
     msgId: 'msg-timeout',
     parts: ['迟到的完整回复'],
     pending: { from: FROM, contextToken: 'tok', resolve: () => { resolved = true }, timer: null },
   }
+  ch.collectors.set(staleCollector.msgId, staleCollector)
   ch.handleSessionEvent({ id: SESSION }, { type: 'turn/end', data: { turn: 9 } })
   await tick()
 
   assert.equal(ch.sent.length, 0) // 不重复发送完整回复
   assert.equal(resolved, true)    // 仍 resolve，避免 handleInbound 悬挂
-  assert.equal(ch.collector, null)
+  assert.equal(ch.collectors.size, 0)
 })
 
 test('turn/end 模型报错且无助手文本：图片不支持 → 回明确提示而非静默', async () => {
@@ -225,14 +552,14 @@ test('normalizeInboundMessages：文本/非文本/空响应（review S10）', ()
   assert.deepEqual(normalizeInboundMessages(null), [])
   const out = normalizeInboundMessages({
     msgs: [
-      { from_user_id: 'u1', to_user_id: 'bot', context_token: 'c1', item_list: [{ type: 1, text_item: { text: '你好' } }] },
-      { from_user_id: 'u2', to_user_id: 'bot', context_token: 'c2', item_list: [{ type: 3, text_item: {} }] },
+      { message_id: 'm1', from_user_id: 'u1', to_user_id: 'bot', context_token: 'c1', item_list: [{ type: 1, text_item: { text: '你好' } }] },
+      { message_id: 'm2', from_user_id: 'u2', to_user_id: 'bot', context_token: 'c2', item_list: [{ type: 3, text_item: {} }] },
       { from_user_id: '', item_list: [{ type: 1, text_item: { text: '无 from 忽略' } }] },
     ],
   })
   assert.equal(out.length, 2)
-  assert.deepEqual(out[0], { from: 'u1', to: 'bot', contextToken: 'c1', text: '你好', voiceText: '', hasText: true, image: null, nonTextTypes: [] })
-  assert.deepEqual(out[1], { from: 'u2', to: 'bot', contextToken: 'c2', text: '', voiceText: '', hasText: false, image: null, nonTextTypes: [3] })
+  assert.deepEqual(out[0], { messageId: 'm1', from: 'u1', to: 'bot', contextToken: 'c1', text: '你好', voiceText: '', hasText: true, image: null, nonTextTypes: [] })
+  assert.deepEqual(out[1], { messageId: 'm2', from: 'u2', to: 'bot', contextToken: 'c2', text: '', voiceText: '', hasText: false, image: null, nonTextTypes: [3] })
 })
 
 test('normalizeInboundMessages：语音转写（voice_item.text）直接进正文', () => {
@@ -526,13 +853,19 @@ test('logout cancels in-flight turns before credentials are removed', async () =
     resolve: () => { resolved = true },
     timer,
   })
-  ch.collector = { sessionId: SESSION, pending: ch.pending.get('message-in-flight') }
+  ch.collectors.set('message-in-flight', {
+    sessionId: SESSION,
+    msgId: 'message-in-flight',
+    pending: ch.pending.get('message-in-flight'),
+  })
+  ch.inbox.push({ text: 'queued before logout' })
 
   await ch.clearCredentials()
 
   assert.equal(resolved, true)
   assert.equal(ch.pending.size, 0)
-  assert.equal(ch.collector, null)
+  assert.equal(ch.collectors.size, 0)
+  assert.equal(ch.inbox.length, 0)
   assert.equal(ch.creds, null)
 })
 

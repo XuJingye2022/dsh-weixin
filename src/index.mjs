@@ -45,6 +45,8 @@ export const Config = Schema.object({
   maxChunk: Schema.number().default(1500),
   // 两条发送之间的最小间隔（毫秒，规避 iLink 限流）
   sendIntervalMs: Schema.number().default(2000),
+  // 超过该时长没有发起新的 getupdates 请求时，管理页不再显示已连接
+  pollStaleMs: Schema.number().default(75_000),
 })
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -98,13 +100,28 @@ export class WeixinChannel {
     this.typingTickets = new Map()
     this.turns = new Map() // sessionId -> current turn
     this.pending = new Map() // userMessage.id -> {from, contextToken, sessionId, resolve, timer}
-    this.collector = null // { sessionId, turn, msgId, parts, pending }
+    this.collectors = new Map() // msgId -> { sessionId, turn, msgId, parts, pending }
+    this.inbox = []
+    this.processing = false
+    this.workerPromise = null
+    this.seenMessageOrder = store.loadSeenMessages?.() ?? []
+    this.seenMessageIds = new Set(this.seenMessageOrder)
+    this.processedMessageIds = new Set(this.seenMessageOrder)
     this.lastSendAt = 0
     this.sendQueue = Promise.resolve() // 发送调速队列（review S6）
     this.stopped = false
     this.monitorRunning = false
     this.monitorAbort = new AbortController()
-    this.status = { baseUrl: null, lastEventAt: null, lastError: null, startedAt: Date.now() }
+    this.status = {
+      baseUrl: null,
+      lastEventAt: null,
+      lastPollAt: null,
+      lastInboundAt: null,
+      lastError: null,
+      pausedUntil: null,
+      pauseReason: null,
+      startedAt: Date.now(),
+    }
     this.logs = [] // ring buffer
     this.login = null // 面板登录流程状态
     this.downloadImageBytes = this.ilink.downloadImageBytes // 测试注入点（默认走 CDN 下载解密）
@@ -143,7 +160,19 @@ export class WeixinChannel {
 
     let failures = 0
     while (!this.stopped && !aborter.signal.aborted) {
+      const now = Date.now()
+      if (this.status.pausedUntil != null) {
+        if (now < this.status.pausedUntil) {
+          await this.waitAbortable(this.status.pausedUntil - now, aborter.signal)
+          continue
+        }
+        this.status.pausedUntil = null
+        this.status.pauseReason = null
+        failures = 0
+        this.pushLog('微信通道暂停结束，恢复长轮询')
+      }
       try {
+        this.status.lastPollAt = Date.now()
         const resp = await this.ilink.getUpdates({
           baseUrl: cred.baseurl, token: cred.bot_token, buf: this.buf, botAgent: this.botAgent,
           signal: aborter.signal,
@@ -152,22 +181,45 @@ export class WeixinChannel {
         failures = 0
         this.status.lastEventAt = Date.now()
         this.status.lastError = null
+        for (const msg of this.ilink.normalizeInboundMessages(resp)) {
+          if (this.stopped || aborter.signal.aborted) break
+          if (!this.acceptInbound(msg)) continue
+          this.status.lastInboundAt = Date.now()
+          this.enqueueInbound(msg)
+        }
         if (typeof resp?.get_updates_buf === 'string' && resp.get_updates_buf) {
           this.buf = resp.get_updates_buf
           this.store.saveBuf(this.buf)
         }
-        for (const msg of this.ilink.normalizeInboundMessages(resp)) {
-          if (this.stopped || aborter.signal.aborted) break
-          await this.handleInbound(msg)
-        }
       } catch (err) {
+        if (err?.ret === -14 || err?.errcode === -14) {
+          this.status.pausedUntil = Date.now() + 60 * 60_000
+          this.status.pauseReason = `iLink 返回 ret=-14，账号暂停一小时：${err?.message ?? err}`
+          this.status.lastError = this.status.pauseReason
+          this.pushLog(this.status.pauseReason)
+          continue
+        }
         failures += 1
         this.status.lastError = err?.message ?? String(err)
         const wait = Math.min(1000 * failures, 15_000)
         this.pushLog(`长轮询异常（${failures}）：${err?.message ?? err}`)
-        await sleep(wait)
+        await this.waitAbortable(wait, aborter.signal)
       }
     }
+  }
+
+  waitAbortable(ms, signal) {
+    if (signal.aborted) return Promise.resolve()
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', done)
+        resolve()
+      }
+      const timer = setTimeout(done, ms)
+      timer.unref?.()
+      signal.addEventListener('abort', done, { once: true })
+    })
   }
 
   async stop() {
@@ -176,6 +228,7 @@ export class WeixinChannel {
     this.monitorAbort.abort()
     this.monitorRunning = false
     this.cancelPending()
+    this.inbox.length = 0
     if (this.creds?.bot_token) {
       try {
         await this.ilink.notifyStop({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, botAgent: this.botAgent })
@@ -188,6 +241,9 @@ export class WeixinChannel {
   applyCredentials(cred) {
     this.cancelPending()
     this.typingTickets.clear()
+    this.inbox.length = 0
+    this.status.pausedUntil = null
+    this.status.pauseReason = null
     this.creds = { ...cred, baseurl: cred.baseurl || this.ilink.DEFAULT_BASE_URL }
     this.store.saveCredentials(this.creds)
     this.monitorAbort.abort()
@@ -201,6 +257,7 @@ export class WeixinChannel {
   async clearCredentials() {
     this.cancelPending()
     this.typingTickets.clear()
+    this.inbox.length = 0
     if (this.creds?.bot_token) {
       try {
         await this.ilink.notifyStop({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, botAgent: this.botAgent })
@@ -211,6 +268,8 @@ export class WeixinChannel {
     this.monitorRunning = false
     this.stopped = true
     this.creds = null
+    this.status.pausedUntil = null
+    this.status.pauseReason = null
     this.store.saveCredentials(null)
     this.pushLog('已登出')
   }
@@ -222,7 +281,60 @@ export class WeixinChannel {
       pending.resolve?.()
     }
     this.pending.clear()
-    this.collector = null
+    this.collectors.clear()
+  }
+
+  enqueueInbound(msg) {
+    this.inbox.push(msg)
+    this.kickWorker()
+  }
+
+  acceptInbound(msg) {
+    const messageId = String(msg?.messageId ?? '').trim()
+    if (!messageId) return true
+    if (this.seenMessageIds.has(messageId)) return false
+    this.seenMessageIds.add(messageId)
+    return true
+  }
+
+  persistSeenMessage(msg) {
+    const messageId = String(msg?.messageId ?? '').trim()
+    if (!messageId || this.processedMessageIds.has(messageId)) return
+    this.processedMessageIds.add(messageId)
+    this.seenMessageOrder.push(messageId)
+    if (this.seenMessageOrder.length > 1000) {
+      const expired = this.seenMessageOrder.shift()
+      this.processedMessageIds.delete(expired)
+      this.seenMessageIds.delete(expired)
+    }
+    try {
+      this.store.saveSeenMessages?.(this.seenMessageOrder)
+    } catch (err) {
+      this.pushLog(`保存消息去重状态失败：${err?.message ?? err}`)
+    }
+  }
+
+  kickWorker() {
+    if (this.processing || this.inbox.length === 0 || this.stopped) return
+    this.processing = true
+    this.workerPromise = this.drainInbox().finally(() => {
+      this.processing = false
+      this.workerPromise = null
+      if (this.inbox.length > 0 && !this.stopped) this.kickWorker()
+    })
+  }
+
+  async drainInbox() {
+    while (!this.stopped && this.inbox.length > 0) {
+      const msg = this.inbox.shift()
+      try {
+        await this.handleInbound(msg)
+      } catch (err) {
+        this.pushLog(`消息处理失败：${err?.message ?? err}`)
+      } finally {
+        this.persistSeenMessage(msg)
+      }
+    }
   }
 
   /* ------------------------------ 会话/代理 ------------------------------ */
@@ -467,13 +579,23 @@ export class WeixinChannel {
         const msgId = event.data?.id
         const pend = this.pending.get(msgId)
         if (pend) {
-          this.collector = { sessionId, turn: this.turns.get(sessionId), msgId, parts: [], pending: pend }
+          const collector = {
+            sessionId,
+            turn: event.data?.turn ?? this.turns.get(sessionId),
+            msgId,
+            parts: [],
+            pending: pend,
+          }
+          pend.turn = collector.turn
+          this.collectors.set(msgId, collector)
         }
         break
       }
       case 'assistant/message': {
-        const c = this.collector
-        if (!c || c.sessionId !== sessionId || event.data?.turn !== c.turn) break
+        const c = [...this.collectors.values()].find(
+          (collector) => collector.sessionId === sessionId && event.data?.turn === collector.turn,
+        )
+        if (!c) break
         const blocks = event.data?.message?.content ?? []
         const texts = blocks.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text)
         if (texts.length) {
@@ -483,9 +605,12 @@ export class WeixinChannel {
         break
       }
       case 'turn/end': {
-        const c = this.collector
-        if (!c || c.sessionId !== sessionId || event.data?.turn !== c.turn) break
-        this.collector = null
+        const c = [...this.collectors.values()].find(
+          (collector) => collector.sessionId === sessionId && event.data?.turn === collector.turn,
+        )
+        if (!c) break
+        this.collectors.delete(c.msgId)
+        this.turns.delete(sessionId)
         const { pending, parts, msgId } = c
         // 已超时：pending 已被超时分支移除，说明「处理超时」已发出，勿重复发送完整回复（review I1）
         if (!this.pending.has(msgId)) {
@@ -584,15 +709,25 @@ export class WeixinChannel {
 
   statusView() {
     this.pruneLogin() // 显式清理过期的登录终态：读路径本身无副作用（review S3 观察项）
+    const now = Date.now()
+    const polling = !!this.status.lastPollAt
+      && now - this.status.lastPollAt <= (this.cfg.pollStaleMs ?? 75_000)
+    const paused = this.status.pausedUntil != null && this.status.pausedUntil > now
     return {
       accountId: this.accountId,
       cwd: this.cfg.cwd,
-      connected: this.monitorRunning && !!this.creds?.bot_token,
+      connected: this.monitorRunning && !!this.creds?.bot_token && polling && !paused,
       loggedInAt: this.creds?.loggedInAt ?? null,
       baseUrl: this.creds?.baseurl ?? null,
       sessionMap: { ...this.sessionMap },
+      lastPollAt: this.status.lastPollAt,
+      lastInboundAt: this.status.lastInboundAt,
       lastEventAt: this.status.lastEventAt,
       lastError: this.status.lastError,
+      processing: this.processing,
+      queued: this.inbox.length,
+      pausedUntil: this.status.pausedUntil,
+      pauseReason: this.status.pauseReason,
       login: this.loginView(),
     }
   }

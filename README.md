@@ -22,6 +22,10 @@
 
 - 每个微信发送者对应一个 Harness 会话，会话映射按 ClawBot 账号隔离。
 - 每个账号独立执行 `getupdates` 长轮询。一个账号处理长任务时，其他账号继续收消息。
+- 长轮询与 AI 处理分开运行。AI 处理长任务时，当前账号仍持续发送 `getupdates` 心跳。
+- 插件持久化最近的 `message_id`，腾讯重投积压消息时只处理一次。
+- `getupdates` 返回 `ret=-14` 或 `errcode=-14` 时，账号暂停一小时，状态页显示暂停原因。
+- 状态接口返回 `lastPollAt`、`lastInboundAt`、`processing`、`queued` 和 `pausedUntil`，并用最近轮询时间判断连接是否健康。
 - 收到文字、语音转写或图片后，插件通过 `agent.followup()` 把消息注入会话。
 - 助手回复通过收到消息时所属的 ClawBot 账号发回。
 - 管理页支持每个账号独立扫码登录、验证码、登出、状态、日志和主动推送。
@@ -94,6 +98,7 @@ node node_modules/dsh-weixin/bin/login.mjs "$DSH_HOME/dsh-weixin" family
         replyTimeoutMs: 900000
         maxChunk: 1500
         sendIntervalMs: 2000
+        pollStaleMs: 75000
 ```
 
 账号 ID 只能包含字母、数字、点、下划线和连字符。ID 不能以符号开头，不能以点结尾，不能是 `.` 或 `..`。ID 不能与 `status`、`logs`、`login`、`verifycode`、`logout`、`send`、`qr.svg` 这些路由名冲突。账号 ID 必须唯一，比较时不区分大小写。这些规则防止账号 ID 跳出状态目录，也避免路由和文件路径冲突。
@@ -151,6 +156,7 @@ Agent 也可以调用 `push_weixin` 工具。工具支持可选的 `accountId` �
 | `replyTimeoutMs` | `900000` | 单轮回复超时，单位毫秒 |
 | `maxChunk` | `1500` | 单条微信消息的最大字符数 |
 | `sendIntervalMs` | `2000` | 同一账号两次发送之间的最小间隔，单位毫秒 |
+| `pollStaleMs` | `75000` | 超过该时长未发起下一次轮询时，状态页不再显示已连接 |
 
 `accounts[].cwd` 为空时，该账号使用自己的状态目录下的 `workspace`。不同账号使用不同 `cwd` 时，会话持久化命名空间和文件工具根目录也不同。
 
@@ -162,14 +168,16 @@ stateDir/
     ├── primary/
     │   ├── credentials.json
     │   ├── session-map.json
-    │   └── updates-buf.json
+    │   ├── updates-buf.json
+    │   └── seen-messages.json
     └── family/
         ├── credentials.json
         ├── session-map.json
-        └── updates-buf.json
+        ├── updates-buf.json
+        └── seen-messages.json
 ```
 
-`credentials.json` 保存 ClawBot 凭据。`session-map.json` 保存该账号内微信用户到 Harness 会话的映射。`updates-buf.json` 保存该账号的轮询游标。
+`credentials.json` 保存 ClawBot 凭据。`session-map.json` 保存该账号内微信用户到 Harness 会话的映射。`updates-buf.json` 保存该账号的轮询游标。`seen-messages.json` 保存最近 1000 个已处理消息 ID，用于跨重启去重。
 
 Harness 会话由 DSH 的会话持久化服务保存，不在插件状态目录中。删除一个账号的 `session-map.json` 不会删除会话，只会让该账号下次收到消息时创建新会话。
 
@@ -203,6 +211,7 @@ source: { kind: 'plugin:dsh-weixin', plugin: 'dsh-weixin' }
 - `cwd` 指向用户工作区时，可以放在 Drive 中。凭据和会话映射仍在 `stateDir`。
 - 账号 ID 经过白名单校验，不能包含路径分隔符。
 - 每个账号只读取自己的凭据、会话映射和游标。
+- 每个账号只读取自己的消息去重记录，不与其他账号共享。
 - 回复发送使用收到消息的账号通道，不使用默认账号代替。
 - 日志不记录 token、二维码链接、完整微信用户 ID、Bot ID 或消息正文。
 - 管理页目前没有独立鉴权。只在可信内网访问，不要绑定公网地址，不要做公网端口转发。
@@ -221,7 +230,7 @@ source: { kind: 'plugin:dsh-weixin', plugin: 'dsh-weixin' }
 
 - 只支持单聊，群聊未适配。
 - 二维码通常在 5 分钟后过期。面板最多自动刷新 3 次。
-- 同一账号内的消息串行处理。一个账号的长回合只阻塞该账号。
+- 同一账号内的 AI 回合进入串行处理队列。一个账号的长回合不会停止该账号的轮询心跳。
 - iLink 返回限流 `ret=-2` 时，插件使用指数退避重试。腾讯仍可能继续节流。
 - ClawBot 仍在逐步开放，腾讯可能调整协议。
 
@@ -232,7 +241,7 @@ pnpm install
 pnpm test
 ```
 
-测试覆盖账号校验、路径隔离、旧状态迁移、并发轮询、发送账号选择、管理路由和 DSH format v4 source kind。
+测试覆盖账号校验、路径隔离、旧状态迁移、轮询心跳、长任务并发、消息去重、`ret=-14` 暂停、回合隔离、发送账号选择、管理路由和 DSH format v4 source kind。
 
 包结构：
 

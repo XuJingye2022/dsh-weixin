@@ -378,9 +378,19 @@ const $ = (id) => document.getElementById(id);
 async function j(url, opts) { const r = await fetch(url, opts); return r.json(); }
 function render(s) {
   const on = s.connected;
-  $('conn').textContent = on ? '已连接' : '未连接';
+  $('conn').textContent = on
+    ? (s.processing ? '已连接，正在处理' : '已连接')
+    : (s.pausedUntil ? '已暂停' : '未连接');
   $('conn').className = on ? 'ok' : 'bad';
-  $('meta').textContent = s.loggedInAt ? '登录时间：' + new Date(s.loggedInAt).toLocaleString() + (s.baseUrl ? ' · ' + s.baseUrl : '') : (s.lastError ? '最近错误：' + s.lastError : '未登录');
+  const meta = [];
+  if (s.loggedInAt) meta.push('登录时间：' + new Date(s.loggedInAt).toLocaleString());
+  if (s.lastPollAt) meta.push('最近轮询：' + new Date(s.lastPollAt).toLocaleString());
+  if (s.lastInboundAt) meta.push('最近来消息：' + new Date(s.lastInboundAt).toLocaleString());
+  if (s.processing || s.queued) meta.push('处理中：' + (s.processing ? '是' : '否') + '，排队：' + (s.queued || 0));
+  if (s.pausedUntil) meta.push('暂停至：' + new Date(s.pausedUntil).toLocaleString() + (s.pauseReason ? '，' + s.pauseReason : ''));
+  if (s.lastError && !s.pauseReason) meta.push('最近错误：' + s.lastError);
+  if (!s.loggedInAt && !s.lastError) meta.push('未登录');
+  $('meta').textContent = meta.join(' · ');
   const rows = Object.entries(s.sessionMap || {});
   const tbl = $('sessions');
   tbl.replaceChildren();
