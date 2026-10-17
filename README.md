@@ -13,6 +13,11 @@
 
 插件是 Cordis bundle，在 Harness 进程内运行，不需要独立桥接进程。
 
+## 兼容性与账号能力
+
+- 兼容 [DeepSeekHarness-NAS](https://github.com/EIGHTfs/DeepSeekHarness-NAS)：已针对群晖原生 DSH 包和会话格式 v4 处理消息 source kind。
+- 支持多微信账号连接：同一个插件实例可以运行多个独立 ClawBot 账号，每个账号拥有自己的凭据、轮询、会话映射、发送队列和工作目录。
+
 ## 主要行为
 
 - 每个微信发送者对应一个 Harness 会话，会话映射按 ClawBot 账号隔离。
