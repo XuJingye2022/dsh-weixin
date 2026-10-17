@@ -17,8 +17,10 @@ test('保存凭据以 0o600 写入且不残留临时文件（review I4/S9）', (
 
     const credFile = path.join(dir, 'credentials.json')
     assert.ok(fs.existsSync(credFile), '应生成 credentials.json')
-    const mode = fs.statSync(credFile).mode & 0o777
-    assert.equal(mode, 0o600, `期望 0600，实际 ${mode.toString(8)}`)
+    if (process.platform !== 'win32') {
+      const mode = fs.statSync(credFile).mode & 0o777
+      assert.equal(mode, 0o600, `期望 0600，实际 ${mode.toString(8)}`)
+    }
 
     // 原子写完成后不应残留 .tmp 临时文件
     const leftovers = fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))

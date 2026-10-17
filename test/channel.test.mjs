@@ -8,6 +8,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createCipheriv } from 'node:crypto'
+import path from 'node:path'
 import { WeixinChannel, chunkText, registerPushTool } from '../src/index.mjs'
 import { resolveWorkspaceDir } from '../src/creds.mjs'
 import { normalizeInboundMessages, sniffImageMime, parseAesKey, downloadImageBytes } from '../src/ilink.mjs'
@@ -151,8 +152,8 @@ test('push 主动推送：单用户与 all 广播', async () => {
 })
 
 test('resolveWorkspaceDir：空值回落到 stateDir/workspace，显式值用显式', () => {
-  assert.equal(resolveWorkspaceDir('', '/tmp/state'), '/tmp/state/workspace')
-  assert.equal(resolveWorkspaceDir('/custom/ws', '/tmp/state'), '/custom/ws')
+  assert.equal(resolveWorkspaceDir('', '/tmp/state'), path.resolve('/tmp/state/workspace'))
+  assert.equal(resolveWorkspaceDir('/custom/ws', '/tmp/state'), path.resolve('/custom/ws'))
 })
 
 test('超时后 turn/end 不重复发送（review I1）', async () => {
@@ -299,6 +300,51 @@ test('handleInbound：语音转写直接作为正文', async () => {
   assert.equal(got.content.length, 1)
   assert.equal(got.content[0].type, 'text')
   assert.equal(got.content[0].text, '明天几点')
+})
+
+test('handleInbound：Synology DSH format v4 使用 producer-owned source kind', async () => {
+  const ch = makeChannel()
+  ch.getTypingTicket = async () => ''
+  let got = null
+  ch.ensureAgentFor = async () => ({
+    id: 'session-source',
+    followup(userMessage) {
+      got = userMessage
+      throw new Error('capture')
+    },
+  })
+
+  await ch.handleInbound({
+    from: FROM,
+    to: 'bot@im.bot',
+    contextToken: 'tok',
+    text: '兼容性测试',
+  })
+
+  assert.deepEqual(got.source, {
+    kind: 'plugin:dsh-weixin',
+    plugin: 'dsh-weixin',
+  })
+})
+
+test('runtime logs omit sender IDs and message text', async () => {
+  const ch = makeChannel()
+  ch.getTypingTicket = async () => ''
+  ch.ensureAgentFor = async () => ({
+    id: 'session-private',
+    followup() { throw new Error('capture') },
+  })
+
+  await ch.handleInbound({
+    from: 'private-sender@im.wechat',
+    to: 'bot@im.bot',
+    contextToken: 'tok',
+    text: 'personal health information',
+  })
+
+  const logs = ch.logs.join('\n')
+  assert.doesNotMatch(logs, /private-sender@im\.wechat/)
+  assert.doesNotMatch(logs, /personal health information/)
 })
 
 test('handleInbound：图片下载解密后注入 image 块（纯图无文字）', async () => {
@@ -467,6 +513,29 @@ test('stopTypingOnce 同一轮只停一次「正在输入」（观察 2 幂等�
   assert.equal(stops, 1)
 })
 
+test('logout cancels in-flight turns before credentials are removed', async () => {
+  const ch = makeChannel()
+  ch.creds = { bot_token: 'tok', baseurl: 'https://example.invalid' }
+  ch.ilink = { ...ch.ilink, notifyStop: async () => ({ ret: 0 }) }
+  let resolved = false
+  const timer = setTimeout(() => {}, 60_000)
+  timer.unref()
+  ch.pending.set('message-in-flight', {
+    from: FROM,
+    contextToken: 'tok',
+    resolve: () => { resolved = true },
+    timer,
+  })
+  ch.collector = { sessionId: SESSION, pending: ch.pending.get('message-in-flight') }
+
+  await ch.clearCredentials()
+
+  assert.equal(resolved, true)
+  assert.equal(ch.pending.size, 0)
+  assert.equal(ch.collector, null)
+  assert.equal(ch.creds, null)
+})
+
 test('composeSetup 为微信 agent 注入禁止反问的通道指令（修复卡住）', async () => {
   const ch = makeChannel() // makeCtx().get 返回 undefined → 无 agentPresets
   const setup = await ch.composeSetup()
@@ -502,4 +571,41 @@ test('registerPushTool 注册 push_weixin：缺省发给会话所属用户，显
 
   assert.deepEqual(calls.map((c) => c.to), ['u1@im.wechat', 'all', 'u2@im.wechat'])
   assert.deepEqual(calls.map((c) => c.text), ['hi', 'hi2', 'hi3'])
+})
+
+test('registerPushTool 多账号：会话归属决定发送账号，跨账号发送被拒绝', async () => {
+  const registered = []
+  const calls = []
+  const makeChannel = (accountId, sessionMap) => ({
+    accountId,
+    sessionMap,
+    push: async (to, text) => {
+      calls.push({ accountId, to, text })
+      return { sent: 1, failed: 0, targets: [to] }
+    },
+  })
+  const channels = new Map([
+    ['primary', makeChannel('primary', { 'primary-user@im.wechat': 'session-primary' })],
+    ['family', makeChannel('family', { 'family-user@im.wechat': 'session-family' })],
+  ])
+  const manager = {
+    accountIds: () => [...channels.keys()],
+    account: (id = '') => channels.get(id || 'primary'),
+  }
+  const ctx = { tools: { register: (definition) => { registered.push(definition) } } }
+
+  registerPushTool(ctx, manager)
+  const tool = registered[0]
+
+  await tool.execute({ text: 'family reply' }, { agent: { id: 'session-family' } })
+  await tool.execute({ accountId: 'primary', to: 'someone@im.wechat', text: 'primary push' }, {})
+  await assert.rejects(
+    () => tool.execute({ accountId: 'primary', text: 'wrong' }, { agent: { id: 'session-family' } }),
+    /不能通过账号 primary/,
+  )
+
+  assert.deepEqual(calls, [
+    { accountId: 'family', to: 'family-user@im.wechat', text: 'family reply' },
+    { accountId: 'primary', to: 'someone@im.wechat', text: 'primary push' },
+  ])
 })

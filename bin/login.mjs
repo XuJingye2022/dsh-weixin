@@ -4,13 +4,14 @@
  * 手机端前置：微信「设置 → 插件 → ClawBot」（iOS ≥ 8.0.70；安卓灰度中）。
  * 凭据写入状态目录（默认 $DSH_HOME/dsh-weixin/credentials.json），插件重启后自动读取。
  *
- * 用法：node bin/login.mjs [stateDir]
+ * 用法：node bin/login.mjs [stateDir] [accountId]
  */
 
 import readline from 'node:readline'
 import qrcode from 'qrcode-generator'
 import * as ilink from '../src/ilink.mjs'
-import { createStore, resolveStateDir } from '../src/creds.mjs'
+import { resolveStateDir } from '../src/creds.mjs'
+import { DEFAULT_ACCOUNT_ID, assertAccountId, createAccountStore } from '../src/accounts.mjs'
 
 const LOGIN_TIMEOUT_MS = 5 * 60_000
 const MAX_QR_REFRESH = 3
@@ -46,10 +47,11 @@ function renderQr(text) {
 
 async function main() {
   const stateDir = resolveStateDir(process.argv[2] ?? '')
-  const store = createStore(stateDir)
+  const accountId = assertAccountId(process.argv[3] ?? DEFAULT_ACCOUNT_ID)
+  const store = createAccountStore(stateDir, accountId, { migrateLegacy: true })
   const existing = store.loadCredentials()
   const localTokenList = existing?.bot_token ? [existing.bot_token] : []
-  console.log(`\n🔑 正在向腾讯 iLink 服务器申请登录二维码（状态目录 ${store.dir}）…`)
+  console.log(`\n🔑 正在向腾讯 iLink 服务器申请登录二维码（账号 ${accountId}，状态目录 ${store.dir}）…`)
 
   let apiBaseUrl = ilink.DEFAULT_BASE_URL
   let qr = await ilink.fetchQRCode({ localTokenList })

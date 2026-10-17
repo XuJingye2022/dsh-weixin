@@ -8,10 +8,15 @@
  *     → turn/end 结算）→ sendmessage 回微信（带 context_token）
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import Schema from '@deepseek-ai/schemastery'
 import * as ilink from './ilink.mjs'
-import { createStore, resolveStateDir, resolveWorkspaceDir } from './creds.mjs'
+import {
+  DEFAULT_ACCOUNT_ID,
+  assertAccountId,
+  createAccountStore,
+  normalizeAccounts,
+} from './accounts.mjs'
 import { registerPanel } from './panel.mjs'
 
 export const name = 'dsh-weixin'
@@ -20,6 +25,13 @@ export const inject = ['webServer', 'agents', 'tools', 'attachments']
 
 /** 可配置参数（默认值即 schema 默认，可在 cordis.yml 覆盖）。 */
 export const Config = Schema.object({
+  // 可选的多账号配置；留空时自动创建向后兼容的 default 账号。
+  accounts: Schema.array(Schema.object({
+    id: Schema.string().required(),
+    cwd: Schema.string().default(''),
+  })).default([]),
+  // /weixin 与 ctx.weixin 的默认账号；留空取 accounts 第一项。
+  defaultAccount: Schema.string().default(''),
   // 新会话的工作目录（绝对路径，决定会话持久化命名空间与文件工具根）；
   // 空 = 自动（stateDir/workspace，跨重启稳定）
   cwd: Schema.string().default(''),
@@ -36,6 +48,7 @@ export const Config = Schema.object({
 })
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const userTag = (userId) => createHash('sha256').update(String(userId ?? '')).digest('hex').slice(0, 8)
 
 /** 登录终态（confirmed/error/expired）后面板保留最终提示的时长，之后自动收起卡片（review S3）。 */
 const LOGIN_DONE_GRACE_MS = 10_000
@@ -69,12 +82,14 @@ function makeUserMessage(input) {
   return { ...input, role: 'user', id: `msg-${randomUUID()}` }
 }
 
-/** 微信用户 → Harness 会话的通道。一个插件实例含一个长轮询 loop 与若干按用户隔离的会话。 */
+/** 单个 ClawBot 账号的通道。每个通道有独立轮询 loop、存储、发送队列与按用户隔离的会话。 */
 export class WeixinChannel {
-  constructor(ctx, config, store) {
+  constructor(ctx, config, store, { ilinkApi = ilink, autoStart = true } = {}) {
     this.ctx = ctx
     this.cfg = config
     this.store = store
+    this.accountId = config.accountId
+    this.ilink = ilinkApi
     this.log = ctx.logger ?? console
     this.creds = store.loadCredentials()
     this.sessionMap = store.loadSessionMap()
@@ -92,15 +107,15 @@ export class WeixinChannel {
     this.status = { baseUrl: null, lastEventAt: null, lastError: null, startedAt: Date.now() }
     this.logs = [] // ring buffer
     this.login = null // 面板登录流程状态
-    this.downloadImageBytes = ilink.downloadImageBytes // 测试注入点（默认走 CDN 下载解密）
+    this.downloadImageBytes = this.ilink.downloadImageBytes // 测试注入点（默认走 CDN 下载解密）
     this.visionCache = new Map() // `provider:model` -> boolean（模型是否支持图片输入）
 
     this.ctx.on('session/event', (session, event) => this.handleSessionEvent(session, event))
     this.ctx.on('dispose', () => this.stop())
 
-    if (this.creds?.bot_token) {
+    if (autoStart && this.creds?.bot_token) {
       this.startMonitor()
-    } else {
+    } else if (autoStart) {
       this.pushLog('未配置微信凭据，等待扫码登录（面板 /weixin 或 bin/login.mjs）')
     }
   }
@@ -115,7 +130,7 @@ export class WeixinChannel {
 
   async startMonitor() {
     const cred = this.creds
-    cred.baseurl = cred.baseurl || ilink.DEFAULT_BASE_URL
+    cred.baseurl = cred.baseurl || this.ilink.DEFAULT_BASE_URL
     this.status.baseUrl = cred.baseurl
     this.monitorRunning = true
     // 本地捕获 controller：applyCredentials/clearCredentials 会替换 this.monitorAbort，
@@ -123,13 +138,13 @@ export class WeixinChannel {
     const aborter = this.monitorAbort
     this.pushLog('微信通道启动（iLink 长轮询）')
     try {
-      await ilink.notifyStart({ baseUrl: cred.baseurl, token: cred.bot_token, botAgent: this.botAgent })
+      await this.ilink.notifyStart({ baseUrl: cred.baseurl, token: cred.bot_token, botAgent: this.botAgent })
     } catch { /* 通知失败不阻塞 */ }
 
     let failures = 0
     while (!this.stopped && !aborter.signal.aborted) {
       try {
-        const resp = await ilink.getUpdates({
+        const resp = await this.ilink.getUpdates({
           baseUrl: cred.baseurl, token: cred.bot_token, buf: this.buf, botAgent: this.botAgent,
           signal: aborter.signal,
         })
@@ -141,7 +156,7 @@ export class WeixinChannel {
           this.buf = resp.get_updates_buf
           this.store.saveBuf(this.buf)
         }
-        for (const msg of ilink.normalizeInboundMessages(resp)) {
+        for (const msg of this.ilink.normalizeInboundMessages(resp)) {
           if (this.stopped || aborter.signal.aborted) break
           await this.handleInbound(msg)
         }
@@ -160,9 +175,10 @@ export class WeixinChannel {
     this.stopped = true
     this.monitorAbort.abort()
     this.monitorRunning = false
+    this.cancelPending()
     if (this.creds?.bot_token) {
       try {
-        await ilink.notifyStop({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, botAgent: this.botAgent })
+        await this.ilink.notifyStop({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, botAgent: this.botAgent })
       } catch { /* ignore */ }
     }
     this.pushLog('微信通道已停止')
@@ -170,7 +186,9 @@ export class WeixinChannel {
 
   /** 登录成功后应用新凭证并重启监视循环。 */
   applyCredentials(cred) {
-    this.creds = { ...cred, baseurl: cred.baseurl || ilink.DEFAULT_BASE_URL }
+    this.cancelPending()
+    this.typingTickets.clear()
+    this.creds = { ...cred, baseurl: cred.baseurl || this.ilink.DEFAULT_BASE_URL }
     this.store.saveCredentials(this.creds)
     this.monitorAbort.abort()
     this.monitorAbort = new AbortController()
@@ -181,9 +199,11 @@ export class WeixinChannel {
 
   /** 登出：清凭证 + 下线通知 + 停监视。 */
   async clearCredentials() {
+    this.cancelPending()
+    this.typingTickets.clear()
     if (this.creds?.bot_token) {
       try {
-        await ilink.notifyStop({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, botAgent: this.botAgent })
+        await this.ilink.notifyStop({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, botAgent: this.botAgent })
       } catch { /* ignore */ }
     }
     this.monitorAbort.abort()
@@ -193,6 +213,16 @@ export class WeixinChannel {
     this.creds = null
     this.store.saveCredentials(null)
     this.pushLog('已登出')
+  }
+
+  cancelPending() {
+    for (const pending of this.pending.values()) {
+      this.stopTypingOnce(pending)
+      if (pending.timer) clearTimeout(pending.timer)
+      pending.resolve?.()
+    }
+    this.pending.clear()
+    this.collector = null
   }
 
   /* ------------------------------ 会话/代理 ------------------------------ */
@@ -245,7 +275,7 @@ export class WeixinChannel {
         const { agent } = await this.ctx.agents.resume({
           resumeSessionId: sessionId, agentOptions: this.resolveDefaultAgentOptions(), setup: await this.composeSetup(),
         })
-        this.pushLog(`恢复持久化会话 ${sessionId}（${userId.slice(0, 12)}…）`)
+        this.pushLog(`恢复持久化会话 ${sessionId}（用户 ${userTag(userId)}）`)
         return agent
       } catch (err) {
         this.pushLog(`恢复会话 ${sessionId} 失败：${err?.message ?? err}，将新建`)
@@ -262,7 +292,7 @@ export class WeixinChannel {
       })
       this.sessionMap[userId] = newId
       this.store.saveSessionMap(this.sessionMap)
-      this.pushLog(`为 ${userId.slice(0, 12)}… 新建会话 ${newId}`)
+      this.pushLog(`为用户 ${userTag(userId)} 新建会话 ${newId}`)
       return agent
     } catch (err) {
       this.pushLog(`新建会话失败：${err?.message ?? err}`)
@@ -283,12 +313,12 @@ export class WeixinChannel {
       await this.sendReply(from, contextToken, '这个格式暂不支持（目前支持文字 / 图片 / 语音）🙏')
       return
     }
-    this.pushLog(`收：${from.slice(0, 12)}… ${(bodyText || '[图片]').slice(0, 60)}`)
+    this.pushLog(`收：用户 ${userTag(from)}，${bodyText ? `文字 ${bodyText.length} 字` : '图片'}`)
 
     // 正在输入提示；发送失败视为 ticket 可能已失效，清缓存下次重建（review S12）
     const ticket = await this.getTypingTicket(from, contextToken)
     if (ticket) {
-      await ilink.sendTyping({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, to: from, typingTicket: ticket, status: 1, botAgent: this.botAgent })
+      await this.ilink.sendTyping({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, to: from, typingTicket: ticket, status: 1, botAgent: this.botAgent })
         .catch(() => { this.typingTickets.delete(from) })
     }
 
@@ -321,7 +351,7 @@ export class WeixinChannel {
 
     const userMessage = makeUserMessage({
       content,
-      source: { kind: 'plugin', plugin: 'dsh-weixin' },
+      source: { kind: 'plugin:dsh-weixin', plugin: 'dsh-weixin' },
     })
 
     await new Promise((resolve) => {
@@ -386,7 +416,7 @@ export class WeixinChannel {
       }
       const attachment = await this.ctx.attachments.saveImage({
         data: bytes, // Buffer 即 Uint8Array
-        mediaType: ilink.sniffImageMime(bytes),
+        mediaType: this.ilink.sniffImageMime(bytes),
       })
       return { type: 'image', attachment }
     } catch (err) {
@@ -399,7 +429,7 @@ export class WeixinChannel {
   stopTyping(userId) {
     const ticket = this.typingTickets.get(userId)
     if (!this.creds?.bot_token || !ticket) return
-    ilink.sendTyping({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, to: userId, typingTicket: ticket, status: 2, botAgent: this.botAgent })
+    this.ilink.sendTyping({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, to: userId, typingTicket: ticket, status: 2, botAgent: this.botAgent })
       .catch(() => {})
   }
 
@@ -413,7 +443,7 @@ export class WeixinChannel {
   async getTypingTicket(userId, contextToken) {
     if (this.typingTickets.has(userId)) return this.typingTickets.get(userId)
     try {
-      const resp = await ilink.getConfig({
+      const resp = await this.ilink.getConfig({
         baseUrl: this.creds.baseurl, token: this.creds.bot_token,
         ilinkUserId: userId, contextToken, botAgent: this.botAgent,
       })
@@ -511,7 +541,7 @@ export class WeixinChannel {
         await this.paceSend() // 每个分块发送前都调速（review I2）
         await this.sendChunk(to, contextToken, piece)
       }
-      this.pushLog(`发：${to.slice(0, 12)}… ${text.slice(0, 60)}`)
+      this.pushLog(`发：用户 ${userTag(to)}，${String(text ?? '').length} 字`)
       return true
     } catch (err) {
       this.pushLog(`发送失败：${err?.message ?? err}`)
@@ -521,7 +551,7 @@ export class WeixinChannel {
 
   /** 发送单个分块；独立成方法便于测试打桩计时。 */
   async sendChunk(to, contextToken, piece) {
-    await ilink.sendMessage({
+    await this.ilink.sendMessage({
       baseUrl: this.creds.baseurl, token: this.creds.bot_token,
       to, text: piece, contextToken, botAgent: this.botAgent,
       onWarn: (w) => this.pushLog(`发送 ${w}`),
@@ -546,7 +576,7 @@ export class WeixinChannel {
       else failed += 1
     }
     const failNote = failed > 0 ? `（失败 ${failed}）` : ''
-    this.pushLog(`主动推送完成：${text.slice(0, 40)} → 成功 ${sent}/${targets.length}${failNote}`)
+    this.pushLog(`主动推送完成：${String(text ?? '').length} 字 → 成功 ${sent}/${targets.length}${failNote}`)
     return { sent, failed, targets }
   }
 
@@ -555,6 +585,8 @@ export class WeixinChannel {
   statusView() {
     this.pruneLogin() // 显式清理过期的登录终态：读路径本身无副作用（review S3 观察项）
     return {
+      accountId: this.accountId,
+      cwd: this.cfg.cwd,
       connected: this.monitorRunning && !!this.creds?.bot_token,
       loggedInAt: this.creds?.loggedInAt ?? null,
       baseUrl: this.creds?.baseurl ?? null,
@@ -587,30 +619,94 @@ export class WeixinChannel {
   }
 }
 
+/** 一个插件实例内的多账号运行时：每个账号拥有独立通道、轮询、存储和 cwd。 */
+export class WeixinManager {
+  constructor(ctx, config, {
+    ilinkApi = ilink,
+    autoStart = true,
+    channelFactory = (channelCtx, channelConfig, store) => (
+      new WeixinChannel(channelCtx, channelConfig, store, { ilinkApi, autoStart })
+    ),
+  } = {}) {
+    this.ctx = ctx
+    this.config = config
+    this.log = ctx.logger ?? console
+    const normalized = normalizeAccounts(config)
+    this.stateDir = normalized.stateDir
+    this.defaultAccountId = normalized.defaultAccountId
+    this.channels = new Map()
+
+    for (const account of normalized.accounts) {
+      const store = createAccountStore(this.stateDir, account.id, {
+        migrateLegacy: account.id === this.defaultAccountId,
+      })
+      const channelConfig = {
+        ...config,
+        accountId: account.id,
+        stateDir: account.stateDir,
+        cwd: account.cwd,
+      }
+      this.channels.set(account.id, channelFactory(ctx, channelConfig, store))
+    }
+    ctx.on?.('dispose', () => this.stop())
+  }
+
+  account(accountId = '') {
+    const id = accountId ? assertAccountId(accountId) : this.defaultAccountId
+    const channel = this.channels.get(id)
+    if (!channel) throw new Error(`账号不存在：${id}`)
+    return channel
+  }
+
+  accountIds() {
+    return [...this.channels.keys()]
+  }
+
+  async stop() {
+    await Promise.allSettled([...this.channels.values()].map((channel) => channel.stop()))
+  }
+}
+
 export function apply(ctx, config) {
-  const stateDir = resolveStateDir(config.stateDir)
-  const cwd = resolveWorkspaceDir(config.cwd, stateDir)
-  const store = createStore(stateDir)
-  const channel = new WeixinChannel(ctx, { ...config, cwd }, store)
-  registerPanel(ctx, channel)
+  const manager = new WeixinManager(ctx, config)
+  registerPanel(ctx, manager)
   // 对外暴露主动推送能力：其它插件 inject ['weixin'] 后用 ctx.weixin.push / sendAll
   ctx.provide('weixin', {
-    push: (to, text) => channel.push(to, text),
-    sendAll: (text) => channel.push('all', text),
-    status: () => channel.statusView(),
-    sessions: () => ({ ...channel.sessionMap }),
+    push: (to, text, accountId) => manager.account(accountId).push(to, text),
+    sendAll: (text, accountId) => manager.account(accountId).push('all', text),
+    status: (accountId) => manager.account(accountId).statusView(),
+    sessions: (accountId) => ({ ...manager.account(accountId).sessionMap }),
+    accounts: () => manager.accountIds().map((id) => ({
+      id,
+      ...manager.account(id).statusView(),
+    })),
   })
-  registerPushTool(ctx, channel)
+  registerPushTool(ctx, manager)
 }
 
 /** 注册 push_weixin 主动推送工具：把 channel.push 暴露给任意 agent（含 DSH schedule 定时触发回合）。 */
-export function registerPushTool(ctx, channel) {
+export function registerPushTool(ctx, source) {
+  const isManager = typeof source?.account === 'function' && typeof source?.accountIds === 'function'
+  const accountIds = () => (isManager ? source.accountIds() : [source?.accountId ?? DEFAULT_ACCOUNT_ID])
+  const account = (accountId = '') => (isManager ? source.account(accountId) : source)
+  const ownerAccount = (sessionId) => {
+    for (const id of accountIds()) {
+      const channel = account(id)
+      const owner = Object.keys(channel.sessionMap ?? {}).find(
+        (userId) => channel.sessionMap[userId] === sessionId,
+      )
+      if (owner) return { accountId: id, userId: owner }
+    }
+    return null
+  }
+
   return ctx.tools.register({
     name: 'push_weixin',
-    description: '主动发送一条文本消息到微信。to 为微信用户 id；"all" = 广播给所有已建会话用户；省略 = 发给触发本工具的会话所属微信用户。适合定时任务、告警等主动触达场景。',
+    description: '主动发送一条文本消息到微信。可按 accountId 选择微信账号；to 为微信用户 id；"all" = 广播给该账号所有已建会话用户；省略 = 发给触发本工具的会话所属微信用户。适合定时任务、告警等主动触达场景。',
     parameters: {
       type: 'object',
       properties: {
+        accountId: { type: 'string', description: '微信账号 ID；省略时按会话归属或默认账号自动选择' },
         to: { type: 'string', description: '微信用户 id（如 user@im.wechat）；"all" 广播所有已建会话；省略 = 触发本工具的会话所属用户' },
         text: { type: 'string', description: '要发送的文本（超过 maxChunk 自动切分）' },
       },
@@ -633,12 +729,17 @@ export function registerPushTool(ctx, channel) {
     },
     async execute(args, exec) {
       const explicit = args.to && String(args.to).trim()
+      const requestedAccount = args.accountId && String(args.accountId).trim()
+      const sid = exec?.agent?.id
+      const owner = sid ? ownerAccount(sid) : null
+      if (requestedAccount && owner && owner.accountId !== requestedAccount) {
+        throw new Error(`会话属于账号 ${owner.accountId}，不能通过账号 ${requestedAccount} 发送`)
+      }
+      const channel = account(requestedAccount || owner?.accountId || '')
       let to = explicit || null
       if (!to) {
-        // 缺省时优先发给触发本工具的会话所属微信用户（schedule 到点醒来正好对应该用户），否则广播
-        const sid = exec?.agent?.id
-        const owner = sid ? Object.keys(channel.sessionMap).find((u) => channel.sessionMap[u] === sid) : undefined
-        to = owner || 'all'
+        // 缺省时优先发给触发本工具的会话所属微信用户（schedule 到点醒来正好对应该用户），否则该账号广播
+        to = owner?.userId || 'all'
       }
       return channel.push(to, String(args.text ?? ''))
     },

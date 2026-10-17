@@ -229,46 +229,81 @@ function submitVerifyCode(channel, code) {
 
 /* ------------------------------ 路由注册 ------------------------------ */
 
-export function registerPanel(ctx, channel) {
+const PANEL_ACTIONS = new Set([
+  'page', 'status', 'logs', 'qr.svg', 'login', 'verifycode', 'logout', 'send',
+])
+const LEGACY_ACTIONS = new Set([
+  'status', 'logs', 'qr.svg', 'login', 'verifycode', 'logout', 'send',
+])
+
+export function parsePanelRoute(pathname) {
+  const clean = String(pathname ?? '').replace(/\/+$/, '') || '/'
+  if (clean !== '/weixin' && !clean.startsWith('/weixin/')) return null
+  const parts = clean.slice('/weixin'.length).split('/').filter(Boolean)
+  if (parts.length === 0) return { accountId: null, action: 'page' }
+  if (parts.length === 1) {
+    if (LEGACY_ACTIONS.has(parts[0])) return { accountId: null, action: parts[0] }
+    return { accountId: parts[0], action: 'page' }
+  }
+  if (parts.length === 2 && PANEL_ACTIONS.has(parts[1])) {
+    return { accountId: parts[0], action: parts[1] }
+  }
+  return null
+}
+
+export function createPanelHandler(manager) {
+  return async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://dsh.local')
+    const route = parsePanelRoute(url.pathname)
+    if (!route) return sendText(res, 'not found', 'text/plain', 404)
+
+    let channel
+    try {
+      channel = manager.account(route.accountId ?? '')
+    } catch (err) {
+      return sendJson(res, { error: err?.message ?? String(err) }, 404)
+    }
+
+    try {
+      if (route.action === 'page') {
+        sendHtml(res, manager, channel.accountId)
+      } else if (route.action === 'status') {
+        sendJson(res, channel.statusView())
+      } else if (route.action === 'logs') {
+        sendJson(res, { logs: channel.logs.slice(-200) })
+      } else if (route.action === 'qr.svg') {
+        const l = channel.login
+        if (!l?.qrUrl) return sendText(res, 'no qr', 'text/plain', 404)
+        sendText(res, qrSvg(l.qrUrl), 'image/svg+xml')
+      } else if (route.action === 'login' && req.method === 'POST') {
+        sendJson(res, await startLogin(channel))
+      } else if (route.action === 'verifycode' && req.method === 'POST') {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        sendJson(res, submitVerifyCode(channel, body?.code ?? ''))
+      } else if (route.action === 'send' && req.method === 'POST') {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const to = String(body?.to ?? '')
+        const text = String(body?.text ?? '')
+        if (!to || !text) throw new Error('缺少参数：to / text')
+        sendJson(res, await channel.push(to, text))
+      } else if (route.action === 'logout' && req.method === 'POST') {
+        await channel.clearCredentials()
+        sendJson(res, { ok: true })
+      } else {
+        sendText(res, 'not found', 'text/plain', 404)
+      }
+    } catch (err) {
+      sendJson(res, { error: err?.message ?? String(err) }, err?.statusCode ?? 500)
+    }
+  }
+}
+
+export function registerPanel(ctx, manager) {
   ctx.effect(
     () => ctx.webServer.register({
       kind: 'prefix',
       path: '/weixin',
-      handler: async (req, res) => {
-        const url = new URL(req.url ?? '/', 'http://dsh.local')
-        const pathname = url.pathname.replace(/\/+$/, '') || '/weixin'
-        try {
-          if (pathname === '/weixin') {
-            sendHtml(res)
-          } else if (pathname === '/weixin/status') {
-            sendJson(res, channel.statusView())
-          } else if (pathname === '/weixin/logs') {
-            sendJson(res, { logs: channel.logs.slice(-200) })
-          } else if (pathname === '/weixin/qr.svg') {
-            const l = channel.login
-            if (!l?.qrUrl) return sendText(res, 'no qr', 'text/plain', 404)
-            sendText(res, qrSvg(l.qrUrl), 'image/svg+xml')
-          } else if (pathname === '/weixin/login' && req.method === 'POST') {
-            sendJson(res, await startLogin(channel))
-          } else if (pathname === '/weixin/verifycode' && req.method === 'POST') {
-            const body = JSON.parse((await readBody(req)) || '{}')
-            sendJson(res, submitVerifyCode(channel, body?.code ?? ''))
-          } else if (pathname === '/weixin/send' && req.method === 'POST') {
-            const body = JSON.parse((await readBody(req)) || '{}')
-            const to = String(body?.to ?? '')
-            const text = String(body?.text ?? '')
-            if (!to || !text) throw new Error('缺少参数：to / text')
-            sendJson(res, await channel.push(to, text))
-          } else if (pathname === '/weixin/logout' && req.method === 'POST') {
-            await channel.clearCredentials()
-            sendJson(res, { ok: true })
-          } else {
-            sendText(res, 'not found', 'text/plain', 404)
-          }
-        } catch (err) {
-          sendJson(res, { error: err?.message ?? String(err) }, err?.statusCode ?? 500)
-        }
-      },
+      handler: createPanelHandler(manager),
     }),
     'dsh-weixin: /weixin panel',
   )
@@ -276,7 +311,13 @@ export function registerPanel(ctx, channel) {
 
 /* ------------------------------ 面板 HTML ------------------------------ */
 
-function sendHtml(res) {
+function sendHtml(res, manager, activeAccountId) {
+  const accountLinks = manager.accountIds().map((id) => {
+    const active = id === activeAccountId ? ' aria-current="page"' : ''
+    const href = `/weixin/${encodeURIComponent(id)}`
+    return `<a href="${href}"${active}>${id}</a>`
+  }).join('')
+  const basePath = `/weixin/${encodeURIComponent(activeAccountId)}`
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -295,11 +336,18 @@ function sendHtml(res) {
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { border: 1px solid #e2e5e9; padding: 6px 8px; text-align: left; word-break: break-all; }
   img.qr { width: 260px; height: 260px; border: 1px solid #e2e5e9; border-radius: 8px; }
+  nav { display: flex; flex-wrap: wrap; gap: 8px; }
+  nav a { border: 1px solid #d0d7de; border-radius: 999px; padding: 5px 10px; color: #0969da; text-decoration: none; }
+  nav a[aria-current="page"] { color: #fff; background: #0969da; border-color: #0969da; }
   #verify { display: none; }
 </style>
 </head>
 <body>
-<h1>📱 微信通道 <span class="muted">dsh-weixin</span></h1>
+<h1>📱 微信通道 <span class="muted">${activeAccountId}</span></h1>
+<div class="card">
+  <b>账号</b>
+  <nav>${accountLinks}</nav>
+</div>
 <div class="card">
   <div class="row">状态：<b id="conn" class="bad">未知</b></div>
   <div class="row muted" id="meta"></div>
@@ -325,6 +373,7 @@ function sendHtml(res) {
   <pre id="logs"></pre>
 </div>
 <script>
+const BASE = ${JSON.stringify(basePath)};
 const $ = (id) => document.getElementById(id);
 async function j(url, opts) { const r = await fetch(url, opts); return r.json(); }
 function render(s) {
@@ -356,18 +405,18 @@ function render(s) {
     $('loginCard').style.display = 'block';
     $('loginMsg').textContent = l.message || l.status;
     $('qr').style.display = l.hasQr ? 'block' : 'none';
-    if (l.hasQr) $('qr').src = '/weixin/qr.svg?t=' + Date.now();
+    if (l.hasQr) $('qr').src = BASE + '/qr.svg?t=' + Date.now();
     $('verify').style.display = l.status === 'need_verifycode' ? 'block' : 'none';
   } else {
     $('loginCard').style.display = 'none';
   }
   if (on) setTimeout(tick, 2000); else setTimeout(tick, 5000);
 }
-async function tick() { try { render(await j('/weixin/status')); } catch { /* 重试 */ } }
-async function login() { const r = await j('/weixin/login', { method: 'POST' }); if (r.error) alert(r.error); tick(); }
-async function logout() { if (!confirm('确定登出微信通道？')) return; await j('/weixin/logout', { method: 'POST' }); tick(); }
-async function submitCode() { const r = await j('/weixin/verifycode', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ code: $('code').value }) }); if (!r.ok) alert(r.message || r.error); tick(); }
-async function logs() { try { const r = await j('/weixin/logs'); $('logs').textContent = r.logs.join('\\n'); } catch {} }
+async function tick() { try { render(await j(BASE + '/status')); } catch { /* 重试 */ } }
+async function login() { const r = await j(BASE + '/login', { method: 'POST' }); if (r.error) alert(r.error); tick(); }
+async function logout() { if (!confirm('确定登出该微信账号？')) return; await j(BASE + '/logout', { method: 'POST' }); tick(); }
+async function submitCode() { const r = await j(BASE + '/verifycode', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ code: $('code').value }) }); if (!r.ok) alert(r.message || r.error); tick(); }
+async function logs() { try { const r = await j(BASE + '/logs'); $('logs').textContent = r.logs.join('\\n'); } catch {} }
 setInterval(logs, 3000);
 tick(); logs();
 </script>
